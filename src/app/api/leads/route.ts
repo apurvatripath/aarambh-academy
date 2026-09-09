@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 
 const visitorTypes = new Set(["Student", "Parent or guardian"]);
 const currentClasses = new Set(["Class 8", "Class 9", "Class 10", "Class 11", "Class 12", "Completed Class 12"]);
@@ -24,6 +24,27 @@ type LeadInput = {
 
 function textField(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+// Dormant until ALERT_WEBHOOK_URL is set — same pattern as lead-desk and
+// missed-call-textback's owner alerts. Works with a Slack or Discord
+// incoming-webhook URL. Never throws: alerting must not affect the caller.
+async function sendAlert(message: string) {
+  const webhookUrl = process.env.ALERT_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: message, content: message }),
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      console.error("aarambh alert delivery rejected", { status: response.status });
+    }
+  } catch (error) {
+    console.error("aarambh alert delivery failed", error);
+  }
 }
 
 function validateLead(value: unknown) {
@@ -81,33 +102,36 @@ export async function POST(request: Request) {
     status: "New",
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
+  // Respond to the visitor immediately; n8n's Gemini scoring step can run
+  // well past any reasonable page-load timeout when the model is under load
+  // (seen: 80s+ vs. a normal ~9s), so the visitor must never wait on it.
+  after(async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+    try {
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-aarambh-webhook-secret": webhookSecret,
+        },
+        body: JSON.stringify(payload),
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const result = await response.json().catch(() => null) as { success?: boolean; submissionId?: string } | null;
 
-  try {
-    const response = await fetch(webhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-aarambh-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify(payload),
-      cache: "no-store",
-      signal: controller.signal,
-    });
-    const result = await response.json().catch(() => null) as { success?: boolean; submissionId?: string; duplicate?: boolean } | null;
-
-    if (!response.ok || result?.success !== true || result.submissionId !== submissionId) {
-      return NextResponse.json({ success: false, submissionId, error: "automation_unavailable" }, { status: 502 });
+      if (!response.ok || result?.success !== true || result.submissionId !== submissionId) {
+        console.error("aarambh lead automation failed", { submissionId, status: response.status });
+        await sendAlert(`Aarambh lead ${submissionId} (${lead.fullName}) did not save — n8n returned status ${response.status}. Check the workflow execution log.`);
+      }
+    } catch (error) {
+      console.error("aarambh lead automation errored", { submissionId, error });
+      await sendAlert(`Aarambh lead ${submissionId} (${lead.fullName}) did not save — request to n8n errored: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      clearTimeout(timeout);
     }
+  });
 
-    return NextResponse.json(
-      { success: true, submissionId, duplicate: result.duplicate === true },
-      { status: result.duplicate === true ? 200 : 201 },
-    );
-  } catch {
-    return NextResponse.json({ success: false, submissionId, error: "automation_unavailable" }, { status: 502 });
-  } finally {
-    clearTimeout(timeout);
-  }
+  return NextResponse.json({ success: true, submissionId }, { status: 201 });
 }
